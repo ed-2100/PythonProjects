@@ -30,19 +30,21 @@ inertia = mass
 # The moment of inertia of a 1 ft x 1 ft square.
 moment_of_inertia = mass * (12 * 0.0254) ** 2 / 6
 
-xyt_to_tttt = np.array([[1, -1, -a],
-                        [1,  1,  a],
-                        [1,  1, -a],
-                        [1, -1,  a]]) / r
+local_vel_to_wheel_vel = np.array([[ 1,  1,  1,  1],
+                                   [-1,  1,  1, -1],
+                                   [-a,  a, -a,  a]]) / r
 
-tttt_to_xyt = np.array([[     1,      1,      1,      1],
-                        [    -1,      1,      1,     -1],
-                        [-1 / a,  1 / a, -1 / a,  1 / a]]) * (r / 4)
+wheel_vel_to_local_vel = np.array([[1, -1, -1 / a],
+                                   [1,  1,  1 / a],
+                                   [1,  1, -1 / a],
+                                   [1, -1,  1 / a]]) * (r / 4)
 
-ctl_to_mot_pow = np.array([[1, -1, -1],
-                           [1,  1,  1],
-                           [1,  1, -1],
-                           [1, -1,  1]])
+control_duty_to_motor_duty = np.array([[ 1,  1,  1,  1],
+                                       [-1,  1,  1, -1],
+                                       [-1,  1, -1,  1]])
+
+
+wheel_torque_to_local_accel = local_vel_to_wheel_vel.T / np.array([inertia, inertia, moment_of_inertia])[np.newaxis, :]
 
 # Calculate the derivative of the state at time t.
 # Given: t, x, y, theta, x', y', theta'
@@ -50,32 +52,33 @@ ctl_to_mot_pow = np.array([[1, -1, -1],
 def equations_of_motion(t: np.float32, state: np.ndarray, control: np.ndarray):
     x, y, theta, vx, vy, omega = state
 
-    velocity = np.array([vx, vy, omega])
+    absolute_vel = np.array([vx, vy, omega])
 
-    dx_dt = velocity
-
-    TTTT_to_axayat = xyt_to_tttt.T / np.array([inertia, inertia, moment_of_inertia])[:, np.newaxis]
+    absolute_to_local = np.array([[np.cos(-theta), -np.sin(-theta),  0],
+                                  [np.sin(-theta),  np.cos(-theta),  0],
+                                  [             0,             0,  1]]).T
     
-    w = xyt_to_tttt @ velocity
+    local_vel = absolute_vel @ absolute_to_local
 
-    motor_powers = ctl_to_mot_pow @ control
-    is_same_direction = ((np.sign(motor_powers * w) + 1) / 2)
-    motor_torques = T_stall * (1 - np.abs(w) * is_same_direction / w_free) * motor_powers
+    wheel_vel = local_vel @ local_vel_to_wheel_vel
 
-    relative_acceleration = TTTT_to_axayat @ motor_torques
+    motor_power = control @ control_duty_to_motor_duty
+    is_same_direction = ((np.sign(motor_power * wheel_vel) + 1) / 2)
+    wheel_torque = T_stall * (1 - np.abs(wheel_vel) * is_same_direction / w_free) * motor_power
 
-    c, s = np.cos(theta), np.sin(theta)
-    R = np.array([[c, -s,  0],
-                  [s,  c,  0],
-                  [0,  0,  1]])
+    local_accel = wheel_torque @ wheel_torque_to_local_accel
 
-    dv_dt = np.dot(R, relative_acceleration)
+    local_to_absolute = np.array([[np.cos(theta), -np.sin(theta),  0],
+                                  [np.sin(theta),  np.cos(theta),  0],
+                                  [            0,              0,  1]]).T
 
-    return np.concatenate([dx_dt, dv_dt])
+    absolute_accel = local_accel @ local_to_absolute
+
+    return np.concatenate([absolute_vel, absolute_accel])
 
 state = np.array([0, 0, 0, 0, 0, 0])
 
-control = np.array([0, 0.4, 0.6])
+control = np.array([0.99, 0, 0.01])
 
 # Integrate the state over the span of delta_t.
 
@@ -109,7 +112,7 @@ def update(frame):
     mag = np.sqrt(np.square(x[3]) + np.square(x[4]))
     angle.set_data(x = x[0], y = x[1], dx = mag * np.cos(x[2]), dy = mag * np.sin(x[2]))
     print(x)
-    print(xyt_to_tttt @ x[3:])
+    print(x[3:] @ local_vel_to_wheel_vel)
     return (vec, angle)
 
 ani = animation.FuncAnimation(fig=fig, func=update, frames=state.shape[0] // 10, interval = delta_t * 1000)
