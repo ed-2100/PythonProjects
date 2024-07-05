@@ -1,5 +1,6 @@
 from math import prod
 import multiprocessing.managers
+from typing import Tuple
 import numpy as np
 import scipy.integrate
 import torch
@@ -15,8 +16,6 @@ from sklearn import preprocessing
 import torch.utils.data
 import torch.multiprocessing as mp
 import adabelief_pytorch
-
-torch.set_num_threads(1)
 
 # global_seed = 123456789
 
@@ -165,14 +164,14 @@ def init_weights(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.kaiming_uniform_(m.weight, a = 0.01, nonlinearity='leaky_relu')
 
-def train(model: nn.Module, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.LRScheduler, data,
+def train(model: nn.Module, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.LRScheduler, dataset,
           device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
 
     model.train()
 
     start = time.time_ns()
-    for i, (inputs, targets) in enumerate(data):
+    for i, (inputs, targets) in enumerate(dataset):
         optimizer.zero_grad()
 
         outputs: torch.Tensor = model(inputs)
@@ -183,39 +182,74 @@ def train(model: nn.Module, optimizer: optim.Optimizer, scheduler: optim.lr_sche
         scheduler.step()
 
         now = time.time_ns()
-        if now - start > 1E9 * 0.1 and i < len(data) - 1:
-            print(f"\r\033[KBatch [{i+1}/{len(data)}], Loss: {loss.item():.8f}, LR: {', '.join(str(i['lr']) for i in optimizer.param_groups)}", end="")
+        if now - start > 1E9 * 0.1 and i < len(dataset) - 1:
+            print(f"\r\033[KBatch [{i+1}/{len(dataset)}], Loss: {loss.item():.8f}, LR: {', '.join(str(i['lr']) for i in optimizer.param_groups)}", end="")
             start = now
 
-def test(model: nn.Module, loader: data.DataLoader,
+def test(model: nn.Module, dataset,
          device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
     model.eval()
     test_loss = 0
 
     with torch.no_grad():
-        for inputs, targets in loader:
+        for inputs, targets in dataset:
             outputs: torch.Tensor = model(inputs)
             test_loss += F.mse_loss(outputs, targets, reduction='sum').item()
 
-    test_loss /= len(loader.dataset) * targets.shape[1]
+    test_loss /= dataset.dataset_len * targets.shape[-1]
     return test_loss
 
 def standardize(tensor: torch.Tensor):
     return (tensor - torch.mean(tensor, dim=0)) / torch.std(tensor, dim=0) # iqr
 
+class BatchedInMemoryDatabase:
+    def __init__(self, *tensors: torch.Tensor, batch_size: int = 1):
+        self.dataset_len = tensors[0].shape[0]
+        for i in tensors: assert i.shape[0] == self.dataset_len
+        self.tensors = tensors
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return -((-self.dataset_len) // self.batch_size)
+
+    # UNTESTED
+    def __getitem__(self, idx: int):
+        if idx > len(self) or idx < 0: raise IndexError
+        if self.batch_size == 1: return tuple(i[idx] for i in self.tensors)
+        if self.batch_size == self.dataset_len: return self.tensors
+        return tuple(i[idx*self.batch_size:idx*self.batch_size+self.batch_size] for i in self.tensors)
+    
+    def __iter__(self):
+        if self.batch_size == 1: return zip(*self.tensors)
+        if self.batch_size == self.dataset_len: return iter((self.tensors,))
+        randind = torch.randperm(self.dataset_len)
+        randomtensors = tuple(i[randind] for i in self.tensors)
+        return (tuple(i[idx*self.batch_size:idx*self.batch_size+self.batch_size] for i in randomtensors) for idx in range(len(self)))
+
 def main(device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
-    num_epochs = 2000
+    num_epochs = 400000
     num_test = 1000
     num_train = 20000
-    batch_size = 256 # 128
+    batch_size = 20000 # 128
+
     inputs, targets = create_data_tensors(num_train + num_test, True, **factory_kwargs)
+
     inputs = standardize(inputs)
     targets = standardize(targets)
-    train_set, test_set = data.random_split(data.TensorDataset(inputs, targets), [num_train, num_test])
-    train_loader = data.DataLoader(train_set, batch_size, True)
-    test_loader = data.DataLoader(test_set, batch_size, False)
+
+    randind = torch.randperm(inputs.shape[0])
+    randomized_inputs = inputs[randind]
+    randomized_targets = targets[randind]
+
+    train_inputs = randomized_inputs[:num_train]
+    train_targets = randomized_targets[:num_train]
+    test_inputs = randomized_inputs[num_train:]
+    test_targets = randomized_targets[num_train:]
+
+    train_loader = BatchedInMemoryDatabase(train_inputs, train_targets, batch_size=batch_size)
+    test_loader = BatchedInMemoryDatabase(test_inputs, test_targets, batch_size=batch_size)
 
     model = MecanumDriveModel(4 + 3, 6, 128, **factory_kwargs); torch.compile(model, options={"triton.cudagraphs" : True})
     model.apply(init_weights)
@@ -236,4 +270,5 @@ def main(device=None, dtype=None):
     print_model_weights(model)
 
 if __name__=="__main__":
-    main(torch.device("cpu"), torch.float32)
+    torch.set_num_threads(1)
+    main(torch.device("cuda"), torch.float32)
