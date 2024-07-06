@@ -1,25 +1,19 @@
-import numpy as np
-import scipy.integrate
 import torch
-import torch.distributed
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import torch.utils
+import torchdiffeq
 import time
-import torch.utils.data
-import multiprocessing as mp
 import adabelief_pytorch
 
 # global_seed = 123456789
 
-rng = np.random.Generator(np.random.SFC64()) # np.random.SeedSequence(global_seed)))
 # torch.manual_seed(global_seed)
 
 delta_t = 1 / 30
 
 T_stall = 5.4 * (1 / 100) # N * m
-w_free = 1620 * (1 / 60) * 2 * np.pi # rad / s
+w_free = 1620 * (1 / 60) * 2 * torch.pi # rad / s
 r = 4 * 0.0254 # m
 mass = 6 # kg
 
@@ -43,78 +37,91 @@ l_x = 0.129907
 l_y = 0.095724
 a = l_x + l_y
 
-local_vel_to_wheel_vel = np.array([[ 1,  1,  1,  1],
-                                   [-1,  1,  1, -1],
-                                   [-a,  a, -a,  a]]) / r
+local_vel_to_wheel_vel = torch.Tensor([[1, -1, -a],
+                                       [1,  1,  a],
+                                       [1,  1, -a],
+                                       [1, -1,  a]]) / r
 
-wheel_vel_to_local_vel = np.array([[1, -1, -1 / a],
-                                   [1,  1,  1 / a],
-                                   [1,  1, -1 / a],
-                                   [1, -1,  1 / a]]) * (r / 4)
+wheel_vel_to_local_vel = torch.Tensor([[     1,     1,      1,     1],
+                                       [    -1,     1,      1,    -1],
+                                       [-1 / a, 1 / a, -1 / a, 1 / a]]) * (r / 4)
 
-control_duty_to_motor_duty = np.array([[ 1,  1,  1,  1],
-                                       [-1,  1,  1, -1],
-                                       [-1,  1, -1,  1]])
+control_duty_to_motor_duty = torch.Tensor([[ 1, -1, -1],
+                                           [ 1,  1,  1],
+                                           [ 1,  1, -1],
+                                           [ 1, -1,  1]])
 
+wheel_torque_to_local_accel = local_vel_to_wheel_vel.T / torch.Tensor([inertia, inertia, moment_of_inertia])[:, None]
 
-wheel_torque_to_local_accel = local_vel_to_wheel_vel.T / np.array([inertia, inertia, moment_of_inertia])[np.newaxis, :]
+class MecanumSystem(nn.Module):
+    def __init__(self, control_duty: torch.Tensor, device=None, dtype=None):
+        super(MecanumSystem, self).__init__()
+        self.factory_kwargs = {'device': device, 'dtype': dtype}
 
-# Calculate the derivative of the state at time t.
-# Given: t, x, y, theta, x', y', theta'
-# Compute: x', y', theta', x'', y'', theta''
-def equations_of_motion(t: float, state: np.ndarray[np.floating], control: np.ndarray[np.floating], dtype=None):
-    state = state.astype(dtype)
-    control = control.astype(dtype)
+        self.local_vel_to_wheel_vel = local_vel_to_wheel_vel.to(**self.factory_kwargs)
+        self.control_duty_to_motor_duty = control_duty_to_motor_duty.to(**self.factory_kwargs)
+        self.wheel_torque_to_local_accel = wheel_torque_to_local_accel.to(**self.factory_kwargs)
 
-    x, y, theta, vx, vy, omega = state
+        self.control_duty = control_duty
 
-    absolute_vel = np.array([vx, vy, omega])
+    # TODO: Do less squeezing and unsqueezing.
+    def forward(self, t: torch.Tensor, state: torch.Tensor):
+        absolute_vel = state[..., 3:]
+        theta = state[..., 2]
 
-    absolute_to_local = np.array([[ np.cos(-theta), np.sin(-theta), 0],
-                                  [-np.sin(-theta), np.cos(-theta), 0],
-                                  [              0,              0, 1]])
-    
-    local_vel = absolute_vel @ absolute_to_local
+        c, s = torch.cos(-theta), torch.sin(-theta)
+        absolute_to_local = torch.zeros(state.shape[:-1] + (3, 3), **self.factory_kwargs)
+        absolute_to_local[..., 0, 0] = c
+        absolute_to_local[..., 0, 1] = -s
+        absolute_to_local[..., 1, 0] = s
+        absolute_to_local[..., 1, 1] = c
+        absolute_to_local[..., 2, 2] = 1
 
-    wheel_vel = local_vel @ local_vel_to_wheel_vel
+        local_vel = torch.matmul(absolute_to_local, absolute_vel.unsqueeze(-1)).squeeze(-1)
 
-    motor_power = control @ control_duty_to_motor_duty
-    is_same_direction = ((np.sign(motor_power * wheel_vel) + 1) / 2)
-    wheel_torque = T_stall * (1 - np.abs(wheel_vel) * is_same_direction / w_free) * motor_power
+        wheel_vel = torch.matmul(self.local_vel_to_wheel_vel, local_vel.unsqueeze(-1)).squeeze(-1)
 
-    local_accel = wheel_torque @ wheel_torque_to_local_accel
+        motor_duty = torch.matmul(self.control_duty_to_motor_duty, self.control_duty.unsqueeze(-1)).squeeze(-1)
 
-    local_to_absolute = np.array([[ np.cos(theta), np.sin(theta), 0],
-                                  [-np.sin(theta), np.cos(theta), 0],
-                                  [             0,             0, 1]])
+        is_same_direction = ((torch.sign(motor_duty * wheel_vel) + 1) / 2)
 
-    absolute_accel = local_accel @ local_to_absolute
+        wheel_torque = T_stall * (1 - torch.abs(wheel_vel) * is_same_direction / w_free) * motor_duty
 
-    return np.concatenate([absolute_vel, absolute_accel], dtype=dtype) # might not need dtype, but just to be safe...
+        local_accel = torch.matmul(self.wheel_torque_to_local_accel, wheel_torque.unsqueeze(-1)).squeeze(-1)
 
-def f(params):
-    return scipy.integrate.solve_ivp(lambda t, y: equations_of_motion(t, y, params[1], dtype=params[2]), (0, delta_t), params[0], t_eval = np.linspace(0, delta_t, 10, dtype=params[2])).y[:, -1]
+        c, s = torch.cos(theta), torch.sin(theta)
+        local_to_absolute = torch.zeros(state.shape[:-1] + (3, 3), **self.factory_kwargs)
+        local_to_absolute[..., 0, 0] = c
+        local_to_absolute[..., 0, 1] = -s
+        local_to_absolute[..., 1, 0] = s
+        local_to_absolute[..., 1, 1] = c
+        local_to_absolute[..., 2, 2] = 1
 
-def create_data_tensors(num_samples: int, noisy = False,
+        absolute_accel = torch.matmul(local_to_absolute, local_accel.unsqueeze(-1)).squeeze(-1)
+
+        return torch.cat((absolute_vel, absolute_accel), dim=-1)
+
+def create_data_tensors(num_samples: int,
                         device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
-    idtype = np.float64
-    position = np.empty((num_samples, 3), dtype=idtype)
-    position[:, 0:2] = 0
-    position[:, 2] = rng.uniform(-np.pi, np.pi, num_samples).astype(idtype)
+    position = torch.zeros((num_samples, 3), **factory_kwargs)
+    position[:, 2] = torch.distributions.Uniform(-torch.pi, torch.pi).sample((num_samples,)).to(position)
 
-    r = rng.uniform(-1, 1, (num_samples, 3)).astype(idtype)
-    wheel_velocity = r @ control_duty_to_motor_duty
-    wheel_velocity = wheel_velocity / np.maximum(np.max(wheel_velocity, axis=-1), 1)[:, np.newaxis] * w_free
-    velocity = wheel_velocity @ wheel_vel_to_local_vel
+    local_duty = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs)
+    wheel_duty = torch.matmul(control_duty_to_motor_duty.to(local_duty), local_duty.unsqueeze(-1)).squeeze(-1)
+    highest_duty = torch.max(wheel_duty, dim=-1).values
+    wheel_velocity = wheel_duty / torch.maximum(highest_duty, torch.full_like(highest_duty, 1))[:, None] * w_free
+    velocity = torch.matmul(wheel_vel_to_local_vel.to(wheel_velocity), wheel_velocity.unsqueeze(-1)).squeeze(-1)
 
-    state = np.concatenate([position, velocity], axis = -1, dtype=idtype)
-    control = rng.uniform(-1, 1, (num_samples, 3)).astype(idtype) / 3
+    state = torch.cat([position, velocity], dim = -1)
+    control = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs) / 3
 
-    predicted = np.stack(mp.Pool().map(f, zip(state, control, (idtype for _ in iter(int, 1))))) - state
+    model = MecanumSystem(control, **factory_kwargs)
 
-    inputs = torch.from_numpy(np.concatenate([state[:, 2:], control], axis = -1, dtype=idtype)).to(**factory_kwargs)
-    targets = torch.from_numpy(predicted).to(**factory_kwargs)
+    predicted = torchdiffeq.odeint_adjoint(model, state, torch.tensor((0, delta_t), **factory_kwargs))[-1] - state
+
+    inputs = torch.cat([state[:, 2:], control], dim = -1)
+    targets = predicted
 
     return (inputs, targets)
 
@@ -163,6 +170,7 @@ def train(model: nn.Module, optimizer: optim.Optimizer, scheduler: optim.lr_sche
 
     start = time.time_ns()
     for i, (inputs, targets) in enumerate(dataset):
+        inputs, targets = inputs.to(**factory_kwargs), targets.to(**factory_kwargs)
         optimizer.zero_grad()
 
         outputs: torch.Tensor = model(inputs)
@@ -185,6 +193,7 @@ def test(model: nn.Module, dataset,
 
     with torch.no_grad():
         for inputs, targets in dataset:
+            inputs, targets = inputs.to(**factory_kwargs), targets.to(**factory_kwargs)
             outputs: torch.Tensor = model(inputs)
             test_loss += F.mse_loss(outputs, targets, reduction='sum').item()
 
@@ -219,10 +228,10 @@ def main(device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
     num_epochs = 50000
     num_test = 1000
-    num_train = 20000
-    batch_size = 20000 # 128
+    num_train = 40000
+    batch_size = 40000 # 128
 
-    inputs, targets = create_data_tensors(num_train + num_test, True, **factory_kwargs)
+    inputs, targets = create_data_tensors(num_train + num_test, **factory_kwargs)
 
     inputs_mean = torch.mean(inputs, dim=0)
     targets_mean = torch.mean(targets, dim=0)
@@ -242,8 +251,10 @@ def main(device=None, dtype=None):
     test_inputs = randomized_inputs[num_train:]
     test_targets = randomized_targets[num_train:]
 
-    train_inputs += torch.distributions.Normal(0, 0.1).sample(train_inputs.shape).to(**factory_kwargs)
-    train_targets += torch.distributions.Normal(0, 0.1).sample(train_targets.shape).to(**factory_kwargs)
+    # print(tuple((i.device, i.dtype) for i in (train_inputs, train_targets, test_inputs, test_targets)))
+
+    train_inputs += torch.distributions.Normal(0, 0.1).sample(train_inputs.shape).to(train_inputs)
+    train_targets += torch.distributions.Normal(0, 0.1).sample(train_targets.shape).to(train_targets)
 
     # train_inputs_mean = torch.mean(train_inputs, dim=0)
     # train_targets_mean = torch.mean(train_targets, dim=0)
@@ -262,7 +273,7 @@ def main(device=None, dtype=None):
 
     model = MecanumDriveModel(4 + 3, 6, 128, **factory_kwargs); torch.compile(model, options={"triton.cudagraphs" : True})
     optimizer = adabelief_pytorch.AdaBelief(model.parameters(), lr=0.01, eps=torch.finfo(dtype).eps, weight_decay=0.001)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.5, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.3, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
 
     start = time.time_ns()
     for epoch in range(num_epochs):

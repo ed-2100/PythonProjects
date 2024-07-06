@@ -93,13 +93,15 @@ class MecanumSystem(nn.Module):
 
         return torch.cat((absolute_vel, absolute_accel), dim=-1)
 
-state = torch.randn(5, 6, device='cuda')
-control = torch.randn(5, 3, device='cuda')
+factory_kwargs = {'device': 'cuda', 'dtype': torch.float32}
 
-model = MecanumSystem(control, device='cuda', dtype=torch.float32)
+state = torch.randn(5, 6, **factory_kwargs)
+control = torch.randn(5, 3, **factory_kwargs)
+
+model = MecanumSystem(control, **factory_kwargs)
 
 new_state = model(0, state)
 
 print(state, control, new_state, sep="\n")
 print()
-print(torchdiffeq.odeint_adjoint(model, state, torch.linspace(0, delta_t, 2, device='cuda', dtype=torch.float32)))
+print(torchdiffeq.odeint_adjoint(model, state, torch.linspace(0, delta_t, 2, **factory_kwargs)))
