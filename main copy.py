@@ -1,6 +1,3 @@
-from math import prod
-import multiprocessing.managers
-from typing import Tuple
 import numpy as np
 import scipy.integrate
 import torch
@@ -9,12 +6,9 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.utils
-import torch.utils.data as data
-from collections.abc import Iterator
 import time
-from sklearn import preprocessing
 import torch.utils.data
-import torch.multiprocessing as mp
+import multiprocessing as mp
 import adabelief_pytorch
 
 # global_seed = 123456789
@@ -141,28 +135,25 @@ class MecanumDriveModel(nn.Module):
         self.fc3 = nn.Linear(hidden_dim // 2, hidden_dim // 4, False, **factory_kwargs)
         self.fc4 = nn.Linear(hidden_dim // 4, output_dim, False, **factory_kwargs)
 
+        torch.nn.init.kaiming_uniform_(self.fc1.weight, a = 0.01, nonlinearity='leaky_relu')
+        torch.nn.init.kaiming_uniform_(self.fc2.weight, a = 0.01, nonlinearity='leaky_relu')
+        torch.nn.init.kaiming_uniform_(self.fc3.weight, a = 0.01, nonlinearity='leaky_relu')
+        torch.nn.init.xavier_uniform_(self.fc4.weight)
+
         self.bn1 = nn.BatchNorm1d(hidden_dim, eps, **factory_kwargs)
         self.bn2 = nn.BatchNorm1d(hidden_dim // 2, eps, **factory_kwargs)
         self.bn3 = nn.BatchNorm1d(hidden_dim // 4, eps, **factory_kwargs)
-
-        self.fcx = nn.Linear(input_dim,       hidden_dim, False, **factory_kwargs)
-        self.fca = nn.Linear(hidden_dim,      hidden_dim // 2, False, **factory_kwargs)
-        self.fcb = nn.Linear(hidden_dim // 2, hidden_dim // 4, False, **factory_kwargs)
 
         self.do = nn.Dropout()
         self.relu = nn.LeakyReLU(negative_slope = 0.01)
         self.sigmoid = nn.Sigmoid()
     
     def forward(self, x):
-        a = self.relu(self.bn1(self.fc1(x))) # + self.fcx(x)
-        b = self.relu(self.bn2(self.fc2(a))) # + self.fca(a)
-        c = self.relu(self.bn3(self.fc3(b))) # + self.fcb(b)
+        a = self.relu(self.bn1(self.fc1(x)))
+        b = self.relu(self.bn2(self.fc2(a)))
+        c = self.relu(self.bn3(self.fc3(b)))
         d = self.fc4(c)
         return d
-
-def init_weights(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.kaiming_uniform_(m.weight, a = 0.01, nonlinearity='leaky_relu')
 
 def train(model: nn.Module, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.LRScheduler, dataset,
           device=None, dtype=None):
@@ -200,9 +191,6 @@ def test(model: nn.Module, dataset,
     test_loss /= dataset.dataset_len * targets.shape[-1]
     return test_loss
 
-def standardize(tensor: torch.Tensor):
-    return (tensor - torch.mean(tensor, dim=0)) / torch.std(tensor, dim=0) # iqr
-
 class BatchedInMemoryDatabase:
     def __init__(self, *tensors: torch.Tensor, batch_size: int = 1):
         self.dataset_len = tensors[0].shape[0]
@@ -229,15 +217,21 @@ class BatchedInMemoryDatabase:
 
 def main(device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
-    num_epochs = 400000
+    num_epochs = 50000
     num_test = 1000
     num_train = 20000
     batch_size = 20000 # 128
 
     inputs, targets = create_data_tensors(num_train + num_test, True, **factory_kwargs)
 
-    inputs = standardize(inputs)
-    targets = standardize(targets)
+    inputs_mean = torch.mean(inputs, dim=0)
+    targets_mean = torch.mean(targets, dim=0)
+    
+    inputs_std = torch.std(inputs, dim=0)
+    targets_std = torch.std(targets, dim=0)
+
+    inputs = (inputs - inputs_mean) / inputs_std
+    targets = (targets - targets_mean) / targets_std
 
     randind = torch.randperm(inputs.shape[0])
     randomized_inputs = inputs[randind]
@@ -248,14 +242,27 @@ def main(device=None, dtype=None):
     test_inputs = randomized_inputs[num_train:]
     test_targets = randomized_targets[num_train:]
 
+    train_inputs += torch.distributions.Normal(0, 0.1).sample(train_inputs.shape).to(**factory_kwargs)
+    train_targets += torch.distributions.Normal(0, 0.1).sample(train_targets.shape).to(**factory_kwargs)
+
+    # train_inputs_mean = torch.mean(train_inputs, dim=0)
+    # train_targets_mean = torch.mean(train_targets, dim=0)
+
+    # train_inputs_std = torch.std(train_inputs, dim=0)
+    # train_targets_std = torch.std(train_targets, dim=0)
+
+    # train_inputs = (train_inputs - train_inputs_mean) / train_inputs_std
+    # test_inputs = (test_inputs - train_inputs_mean) / train_inputs_std
+
+    # train_targets = (train_targets - train_targets_mean) / train_targets_std
+    # test_targets = (test_targets - train_targets_mean) / train_targets_std
+
     train_loader = BatchedInMemoryDatabase(train_inputs, train_targets, batch_size=batch_size)
     test_loader = BatchedInMemoryDatabase(test_inputs, test_targets, batch_size=batch_size)
 
     model = MecanumDriveModel(4 + 3, 6, 128, **factory_kwargs); torch.compile(model, options={"triton.cudagraphs" : True})
-    model.apply(init_weights)
-
     optimizer = adabelief_pytorch.AdaBelief(model.parameters(), lr=0.01, eps=torch.finfo(dtype).eps, weight_decay=0.001)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.1, steps_per_epoch=len(train_loader), epochs=num_epochs)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.5, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
 
     start = time.time_ns()
     for epoch in range(num_epochs):
