@@ -10,96 +10,7 @@ import adabelief_pytorch
 
 # torch.manual_seed(global_seed)
 
-delta_t = 1 / 30
-
-T_stall = 5.4 * (1 / 100) # N * m
-w_free = 1620 * (1 / 60) * 2 * torch.pi # rad / s
-r = 4 * 0.0254 # m
-mass = 6 # kg
-
-# Percent of maximum motor torque.
-Q = 0.65
-
-inertia = mass
-
-# The moment of inertia of a 1 ft x 1 ft square.
-moment_of_inertia = mass * (12 * 0.0254) ** 2 / 6
-
-# ##MMMMMMMM##
-# ##M      M## |
-#   M      M   + l_y
-#   M      M   |
-# ##M      M## |
-# ##MMMMMMMM##
-#  ---l_x----
-
-l_x = 0.129907
-l_y = 0.095724
-a = l_x + l_y
-
-local_vel_to_wheel_vel = torch.Tensor([[1, -1, -a],
-                                       [1,  1,  a],
-                                       [1,  1, -a],
-                                       [1, -1,  a]]) / r
-
-wheel_vel_to_local_vel = torch.Tensor([[     1,     1,      1,     1],
-                                       [    -1,     1,      1,    -1],
-                                       [-1 / a, 1 / a, -1 / a, 1 / a]]) * (r / 4)
-
-control_duty_to_motor_duty = torch.Tensor([[ 1, -1, -1],
-                                           [ 1,  1,  1],
-                                           [ 1,  1, -1],
-                                           [ 1, -1,  1]])
-
-wheel_torque_to_local_accel = local_vel_to_wheel_vel.T / torch.Tensor([inertia, inertia, moment_of_inertia])[:, None]
-
-class MecanumSystem(nn.Module):
-    def __init__(self, control_duty: torch.Tensor, device=None, dtype=None):
-        super(MecanumSystem, self).__init__()
-        self.factory_kwargs = {'device': device, 'dtype': dtype}
-
-        self.local_vel_to_wheel_vel = local_vel_to_wheel_vel.to(**self.factory_kwargs)
-        self.control_duty_to_motor_duty = control_duty_to_motor_duty.to(**self.factory_kwargs)
-        self.wheel_torque_to_local_accel = wheel_torque_to_local_accel.to(**self.factory_kwargs)
-
-        self.control_duty = control_duty
-
-    # TODO: Do less squeezing and unsqueezing.
-    def forward(self, t: torch.Tensor, state: torch.Tensor):
-        absolute_vel = state[..., 3:]
-        theta = state[..., 2]
-
-        c, s = torch.cos(-theta), torch.sin(-theta)
-        absolute_to_local = torch.zeros(state.shape[:-1] + (3, 3), **self.factory_kwargs)
-        absolute_to_local[..., 0, 0] = c
-        absolute_to_local[..., 0, 1] = -s
-        absolute_to_local[..., 1, 0] = s
-        absolute_to_local[..., 1, 1] = c
-        absolute_to_local[..., 2, 2] = 1
-
-        local_vel = torch.matmul(absolute_to_local, absolute_vel.unsqueeze(-1)).squeeze(-1)
-
-        wheel_vel = torch.matmul(self.local_vel_to_wheel_vel, local_vel.unsqueeze(-1)).squeeze(-1)
-
-        motor_duty = torch.matmul(self.control_duty_to_motor_duty, self.control_duty.unsqueeze(-1)).squeeze(-1)
-
-        is_same_direction = ((torch.sign(motor_duty * wheel_vel) + 1) / 2)
-
-        wheel_torque = T_stall * (1 - torch.abs(wheel_vel) * is_same_direction / w_free) * motor_duty
-
-        local_accel = torch.matmul(self.wheel_torque_to_local_accel, wheel_torque.unsqueeze(-1)).squeeze(-1)
-
-        c, s = torch.cos(theta), torch.sin(theta)
-        local_to_absolute = torch.zeros(state.shape[:-1] + (3, 3), **self.factory_kwargs)
-        local_to_absolute[..., 0, 0] = c
-        local_to_absolute[..., 0, 1] = -s
-        local_to_absolute[..., 1, 0] = s
-        local_to_absolute[..., 1, 1] = c
-        local_to_absolute[..., 2, 2] = 1
-
-        absolute_accel = torch.matmul(local_to_absolute, local_accel.unsqueeze(-1)).squeeze(-1)
-
-        return torch.cat((absolute_vel, absolute_accel), dim=-1)
+import robotsystem
 
 def create_data_tensors(num_samples: int,
                         device=None, dtype=None):
@@ -108,22 +19,19 @@ def create_data_tensors(num_samples: int,
     position[:, 2] = torch.distributions.Uniform(-torch.pi, torch.pi).sample((num_samples,)).to(position)
 
     local_duty = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs)
-    wheel_duty = torch.matmul(control_duty_to_motor_duty.to(local_duty), local_duty.unsqueeze(-1)).squeeze(-1)
+    wheel_duty = torch.matmul(robotsystem.control_duty_to_motor_duty.to(local_duty), local_duty.unsqueeze(-1)).squeeze(-1)
     highest_duty = torch.max(wheel_duty, dim=-1).values
-    wheel_velocity = wheel_duty / torch.maximum(highest_duty, torch.full_like(highest_duty, 1))[:, None] * w_free
-    velocity = torch.matmul(wheel_vel_to_local_vel.to(wheel_velocity), wheel_velocity.unsqueeze(-1)).squeeze(-1)
+    wheel_velocity = wheel_duty / torch.maximum(highest_duty, torch.full_like(highest_duty, 1))[:, None] * robotsystem.w_free
+    velocity = torch.matmul(robotsystem.wheel_rot_to_local.to(wheel_velocity), wheel_velocity.unsqueeze(-1)).squeeze(-1)
 
     state = torch.cat([position, velocity], dim = -1)
     control = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs) / 3
 
-    model = MecanumSystem(control, **factory_kwargs)
+    model = robotsystem.MecanumSystemModel(control, **factory_kwargs)
 
-    predicted = torchdiffeq.odeint_adjoint(model, state, torch.tensor((0, delta_t), **factory_kwargs))[-1] - state
+    predicted = torchdiffeq.odeint_adjoint(model, state, torch.tensor((0, 1 / 30), **factory_kwargs))[-1] - state
 
-    inputs = torch.cat([state[:, 2:], control], dim = -1)
-    targets = predicted
-
-    return (inputs, targets)
+    return (torch.cat([state[:, 2:], control], dim = -1), predicted)
 
 def print_model_weights(model: nn.Module):
     for param_tensor in model.state_dict():
@@ -173,8 +81,8 @@ def train(model: nn.Module, optimizer: optim.Optimizer, scheduler: optim.lr_sche
         inputs, targets = inputs.to(**factory_kwargs), targets.to(**factory_kwargs)
         optimizer.zero_grad()
 
-        outputs: torch.Tensor = model(inputs)
-        loss: torch.Tensor = F.mse_loss(outputs, targets)
+        outputs = model(inputs)
+        loss = F.mse_loss(outputs, targets)
 
         loss.backward()
         optimizer.step()
@@ -218,10 +126,10 @@ class BatchedInMemoryDatabase:
         return tuple(i[idx*self.batch_size:idx*self.batch_size+self.batch_size] for i in self.tensors)
     
     def __iter__(self):
-        if self.batch_size == 1: return zip(*self.tensors)
         if self.batch_size == self.dataset_len: return iter((self.tensors,))
         randind = torch.randperm(self.dataset_len)
         randomtensors = tuple(i[randind] for i in self.tensors)
+        if self.batch_size == 1: return zip(*randomtensors)
         return (tuple(i[idx*self.batch_size:idx*self.batch_size+self.batch_size] for i in randomtensors) for idx in range(len(self)))
 
 def main(device=None, dtype=None):
@@ -251,10 +159,8 @@ def main(device=None, dtype=None):
     test_inputs = randomized_inputs[num_train:]
     test_targets = randomized_targets[num_train:]
 
-    # print(tuple((i.device, i.dtype) for i in (train_inputs, train_targets, test_inputs, test_targets)))
-
-    train_inputs += torch.distributions.Normal(0, 0.1).sample(train_inputs.shape).to(train_inputs)
-    train_targets += torch.distributions.Normal(0, 0.1).sample(train_targets.shape).to(train_targets)
+    # train_inputs += torch.distributions.Normal(0, 0.1).sample(train_inputs.shape).to(train_inputs)
+    # train_targets += torch.distributions.Normal(0, 0.1).sample(train_targets.shape).to(train_targets)
 
     # train_inputs_mean = torch.mean(train_inputs, dim=0)
     # train_targets_mean = torch.mean(train_targets, dim=0)
@@ -273,7 +179,7 @@ def main(device=None, dtype=None):
 
     model = MecanumDriveModel(4 + 3, 6, 128, **factory_kwargs); torch.compile(model, options={"triton.cudagraphs" : True})
     optimizer = adabelief_pytorch.AdaBelief(model.parameters(), lr=0.01, eps=torch.finfo(dtype).eps, weight_decay=0.001)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.3, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.2, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
 
     start = time.time_ns()
     for epoch in range(num_epochs):
