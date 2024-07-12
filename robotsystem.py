@@ -1,18 +1,15 @@
 import torch
 
-T_stall = 5.4 * (1 / 100) # N * m
-w_free = 1520 * (1 / 60) * 2 * torch.pi # rad / s
-r = 4 * 0.0254 # m
+G = 5.2
+w_free = 1150
+
+r = 3 * 0.0254 # m
+
 mass = 6 # kg
-
-# Percent of maximum motor torque.
-Q = 0.65
-
-
-# The moment of inertia of a 1 ft x 1 ft square.
-moment_of_inertia = mass * (12 * 0.0254) ** 2 / 6
+moment_of_inertia = mass * (12 * 0.0254) ** 2 / 6 # The moment of inertia of a 1 ft x 1 ft square.
 
 inertia = torch.tensor((mass, mass, moment_of_inertia))
+
 # ##MMMMMMMM##
 # ##M      M## |
 #   M      M   | l_y
@@ -30,14 +27,9 @@ local_to_wheel = torch.tensor([[1, -1, -(l_x + l_y)],
                                [1,  1, -(l_x + l_y)],
                                [1, -1,  (l_x + l_y)]], dtype=torch.float64)
 wheel_to_local = torch.linalg.pinv(local_to_wheel)
-
 local_to_wheel_rot = local_to_wheel / r
 wheel_rot_to_local = wheel_to_local * r
-
-local_force_to_wheel_torque = local_to_wheel * r
 wheel_torque_to_local_force = wheel_to_local / r
-
-local_accel_to_wheel_torque = local_force_to_wheel_torque * inertia[None, :]
 wheel_torque_to_local_accel = wheel_torque_to_local_force / inertia[:, None]
 
 control_duty_to_motor_duty = torch.tensor([[ 1, -1, -1],
@@ -55,9 +47,6 @@ class MecanumSystemModel(torch.nn.Module):
         self.factory_kwargs = {'device': device, 'dtype': dtype}
 
         self.local_to_wheel_rot = local_to_wheel_rot.to(**self.factory_kwargs)
-        self.wheel_to_local = wheel_to_local.to(**self.factory_kwargs)
-        self.local_to_wheel = local_to_wheel.to(**self.factory_kwargs)
-        self.inertia = inertia.to(**self.factory_kwargs)
         self.control_duty_to_motor_duty = control_duty_to_motor_duty.to(**self.factory_kwargs)
         self.wheel_torque_to_local_accel = wheel_torque_to_local_accel.to(**self.factory_kwargs)
 
@@ -83,19 +72,10 @@ class MecanumSystemModel(torch.nn.Module):
 
         motor_duty = self.control_duty_to_motor_duty @ self.control_duty.unsqueeze(-1)
 
-        epsilon = 0.001
-
-        is_same_direction = ((torch.sgn(motor_duty * wheel_vel) + 1) / 2)
-
-        wheel_torque = T_stall * (1 - torch.abs(wheel_vel) * is_same_direction / w_free) * motor_duty
-        
-        viscous_friction = 0.0003 * wheel_vel
-        coulomb_friction = 0.01 * softsign(wheel_vel, epsilon)
-        
-        effective_wheel_torque = wheel_torque - viscous_friction - coulomb_friction
+        wheel_torque = (motor_duty * 0.193 - wheel_vel * G * 0.000304 - softsign(wheel_vel, 0.001) * 0.00317) * G
 
         local_to_absolute = torch.linalg.pinv(absolute_to_local)
 
-        absolute_accel = (local_to_absolute @ self.wheel_torque_to_local_accel @ effective_wheel_torque).squeeze(-1)
+        absolute_accel = (local_to_absolute @ self.wheel_torque_to_local_accel @ wheel_torque).squeeze(-1)
 
         return torch.cat((absolute_vel, absolute_accel), dim=-1)

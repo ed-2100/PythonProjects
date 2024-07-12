@@ -6,6 +6,9 @@ import torch
 import time
 import torchdiffeq
 
+torch.set_num_threads(1)
+factory_kwargs = {'device': 'cuda', 'dtype': torch.float32}
+
 pygame.init()
 
 width, height = 800, 600
@@ -15,8 +18,6 @@ pygame.display.set_caption('Mecanum Simulator')
 running = True
 
 framerate_max = 30
-
-factory_kwargs = {'device': 'cpu', 'dtype': torch.float32}
 
 state = torch.tensor((0, 0, 0, 0, 0, 0), **factory_kwargs)
 control = torch.tensor((0, 0, 0), **factory_kwargs)
@@ -49,12 +50,12 @@ while running:
             else:
                 try:
                     idx = key_map.index(event.key)
-                    if idx != -1: keys[idx] = 1
+                    keys[idx] = 1
                 except: pass
         elif event.type == pygame.KEYUP:
             try:
                 idx = key_map.index(event.key)
-                if idx != -1: keys[idx] = 0
+                keys[idx] = 0
             except: pass
 
     control = (keys[:3] - keys[3:])
@@ -63,11 +64,15 @@ while running:
     
     model.set_control_duty(control)
 
-    state = torchdiffeq.odeint_adjoint(model, state, torch.tensor((0, delta_t), **factory_kwargs))[-1] # , method='rk4', options=dict(step_size=delta_t/10)
+    state = torchdiffeq.odeint_adjoint(model,
+                                       state,
+                                       torch.tensor((0, delta_t), **factory_kwargs),
+                                       method='rk4',
+                                       options=dict(step_size=delta_t/10))[-1]
     state[2] %= 2 * torch.pi
 
     rotated_surface = pygame.transform.rotate(rect_surface, state[2] / torch.pi * 180)
-    rotated_rect = rotated_surface.get_rect(center=((state[0] * (width / 2.)) + (width / 2.), (-state[1] * (width / 2.)) + (height / 2.)))
+    rotated_rect = rotated_surface.get_rect(center=((state[0] * (width / 4.)) + (width / 2.), (-state[1] * (width / 4.)) + (height / 2.)))
 
     screen.fill((255, 255, 255))
     screen.blit(rotated_surface, rotated_rect.topleft)
@@ -80,7 +85,7 @@ while running:
     time_left = 1 / framerate_max - frametime
     if time_left > 0:
         time.sleep(time_left)
-    delta_t = time.time() - begin
+    # delta_t = time.time() - begin
 
 pygame.quit()
 sys.exit()

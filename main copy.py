@@ -29,7 +29,11 @@ def create_data_tensors(num_samples: int,
 
     model = robotsystem.MecanumSystemModel(control, **factory_kwargs)
 
-    predicted = torchdiffeq.odeint_adjoint(model, state, torch.tensor((0, 1 / 30), **factory_kwargs))[-1] - state
+    predicted = torchdiffeq.odeint_adjoint(model,
+                                           state,
+                                           torch.tensor((0, 1 / 30),**factory_kwargs),
+                                           method='rk4',
+                                           options=dict(step_size=1/30/10))[-1] - state
 
     return (torch.cat([state[:, 2:], control], dim = -1), predicted)
 
@@ -134,7 +138,7 @@ class BatchedInMemoryDatabase:
 
 def main(device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
-    num_epochs = 50000
+    num_epochs = 5000
     num_test = 1000
     num_train = 40000
     batch_size = 40000 # 128
