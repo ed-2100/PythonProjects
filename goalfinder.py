@@ -1,7 +1,15 @@
+import torch
+import drivemodel
+
+model = drivemodel.MecanumDriveModel('cpu', torch.float)
+model.load_state_dict(torch.load('state_dict.pt'))
+
+model.eval()
+inputs_mean, inputs_std, outputs_mean, outputs_std = torch.load('scale_factors.pt')
+print(inputs_mean, inputs_std, outputs_mean, outputs_std, sep='\n')
+
 import math
 import pygame
-import robotsystem
-import torch
 import time
 import torchdiffeq
 
@@ -48,8 +56,6 @@ key_behavior = torch.tensor(((0, -1,  0,  1,  0,  0),
                              (0,  0,  0,  0,  1, -1)), **param2)
 key = torch.full((6,), 0, **param2)
 
-model = robotsystem.MecanumSystemModel(control, **param2)
-
 rect_size = unit * in_to_m * 12
 rect_surface = pygame.Surface(tuple(rect_size.cpu().to(dtype=torch.int).numpy()), pygame.SRCALPHA)
 rect_surface.fill((255, 0, 0))
@@ -78,13 +84,14 @@ while running:
     control[:2] = torch.nan_to_num(control[:2] / torch.sqrt(torch.sum(torch.square(control[:2]))))
     control /= math.sqrt(2) / 2 * 2 + 1
 
-    model.set_control_duty(control)
+    inputs = torch.cat((state[2:], control))
+    # inputs = (inputs - inputs_mean) / inputs_std
 
-    state = torchdiffeq.odeint_adjoint(model,
-                                       state,
-                                       torch.tensor((0, delta_t), **param2),
-                                       method='rk4',
-                                       options=dict(step_size=delta_t/10))[-1]
+    outputs = model.forward(inputs.unsqueeze(0)).squeeze(0)
+    # outputs = (outputs * outputs_std) + outputs_mean
+    state += outputs
+    # state[:2] += outputs[:2]
+    # state[2:] = outputs[2:]
     state[2] = ((state[2] + torch.pi) % (2 * torch.pi)) - torch.pi
     
     rotated_surface = pygame.transform.rotate(rect_surface, state[2] / torch.pi * 180)

@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,6 +11,7 @@ import adabelief_pytorch
 
 # torch.manual_seed(global_seed)
 
+import drivemodel
 import robotsystem
 
 def create_data_tensors(num_samples: int,
@@ -20,59 +22,43 @@ def create_data_tensors(num_samples: int,
 
     local_duty = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs)
     wheel_duty = torch.matmul(robotsystem.control_duty_to_motor_duty.to(local_duty), local_duty.unsqueeze(-1)).squeeze(-1)
-    highest_duty = torch.max(wheel_duty, dim=-1).values
-    wheel_velocity = wheel_duty / torch.maximum(highest_duty, torch.full_like(highest_duty, 1))[:, None] * robotsystem.w_free
+    a = torch.max(wheel_duty, dim=-1, keepdim=True).values
+    b = torch.maximum(torch.full_like(a, 1), a)
+    print(b.shape)
+    wheel_duty = wheel_duty / b
+    c = torch.sum(wheel_duty, dim=-1, keepdim=True)
+    d = torch.maximum(torch.full_like(c, 1), c)
+    wheel_duty = wheel_duty / d
+    print(d.shape)
+    wheel_velocity = wheel_duty * 300
     velocity = torch.matmul(robotsystem.wheel_rot_to_local.to(wheel_velocity), wheel_velocity.unsqueeze(-1)).squeeze(-1)
 
     state = torch.cat([position, velocity], dim = -1)
-    control = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs) / 3
+    control = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs)
+    control = torch.matmul(robotsystem.control_duty_to_motor_duty.to(control), control.unsqueeze(-1)).squeeze(-1)
+    a = torch.max(control, dim=-1, keepdim=True).values
+    b = torch.maximum(torch.full_like(a, 1), a)
+    control = control / b
+    c = torch.sum(control, dim=-1, keepdim=True)
+    d = torch.maximum(torch.full_like(c, 1), c)
+    control = control / d
+    control = torch.matmul(robotsystem.motor_duty_to_control_duty.to(control), control.unsqueeze(-1)).squeeze(-1)
 
-    model = robotsystem.MecanumSystemModel(control, **factory_kwargs)
+    model = robotsystem.MecanumSystemModel(**factory_kwargs)
+    model.set_control_duty(control)
 
     predicted = torchdiffeq.odeint_adjoint(model,
                                            state,
-                                           torch.tensor((0, 1 / 30),**factory_kwargs),
+                                           torch.tensor((0, drivemodel.delta_t), **factory_kwargs),
                                            method='rk4',
-                                           options=dict(step_size=1/30/10))[-1] - state
+                                           options=dict(step_size=drivemodel.delta_t/10))[-1] - state
+    # predicted[0] = ((predicted[2] + torch.pi) % (2 * torch.pi)) - torch.pi
 
     return (torch.cat([state[:, 2:], control], dim = -1), predicted)
 
 def print_model_weights(model: nn.Module):
     for param_tensor in model.state_dict():
         print(f"{param_tensor}: {model.state_dict()[param_tensor]}")
-
-class MecanumDriveModel(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim,
-                 device=None, dtype=None):
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        super(MecanumDriveModel, self).__init__()
-
-        eps = torch.finfo(dtype).eps
-
-        self.fc1 = nn.Linear(input_dim,       hidden_dim, False, **factory_kwargs)
-        self.fc2 = nn.Linear(hidden_dim,      hidden_dim // 2, False, **factory_kwargs)
-        self.fc3 = nn.Linear(hidden_dim // 2, hidden_dim // 4, False, **factory_kwargs)
-        self.fc4 = nn.Linear(hidden_dim // 4, output_dim, False, **factory_kwargs)
-
-        torch.nn.init.kaiming_uniform_(self.fc1.weight, a = 0.01, nonlinearity='leaky_relu')
-        torch.nn.init.kaiming_uniform_(self.fc2.weight, a = 0.01, nonlinearity='leaky_relu')
-        torch.nn.init.kaiming_uniform_(self.fc3.weight, a = 0.01, nonlinearity='leaky_relu')
-        torch.nn.init.xavier_uniform_(self.fc4.weight)
-
-        self.bn1 = nn.BatchNorm1d(hidden_dim, eps, **factory_kwargs)
-        self.bn2 = nn.BatchNorm1d(hidden_dim // 2, eps, **factory_kwargs)
-        self.bn3 = nn.BatchNorm1d(hidden_dim // 4, eps, **factory_kwargs)
-
-        self.do = nn.Dropout()
-        self.relu = nn.LeakyReLU(negative_slope = 0.01)
-        self.sigmoid = nn.Sigmoid()
-    
-    def forward(self, x):
-        a = self.relu(self.bn1(self.fc1(x)))
-        b = self.relu(self.bn2(self.fc2(a)))
-        c = self.relu(self.bn3(self.fc3(b)))
-        d = self.fc4(c)
-        return d
 
 def train(model: nn.Module, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.LRScheduler, dataset,
           device=None, dtype=None):
@@ -145,14 +131,14 @@ def main(device=None, dtype=None):
 
     inputs, targets = create_data_tensors(num_train + num_test, **factory_kwargs)
 
-    inputs_mean = torch.mean(inputs, dim=0)
-    targets_mean = torch.mean(targets, dim=0)
+    # inputs_mean = torch.mean(inputs, dim=0)
+    # targets_mean = torch.mean(targets, dim=0)
     
-    inputs_std = torch.std(inputs, dim=0)
-    targets_std = torch.std(targets, dim=0)
+    # inputs_std = torch.std(inputs, dim=0)
+    # targets_std = torch.std(targets, dim=0)
 
-    inputs = (inputs - inputs_mean) / inputs_std
-    targets = (targets - targets_mean) / targets_std
+    # inputs = (inputs - inputs_mean) / inputs_std
+    # targets = (targets - targets_mean) / targets_std
 
     randind = torch.randperm(inputs.shape[0])
     randomized_inputs = inputs[randind]
@@ -166,24 +152,12 @@ def main(device=None, dtype=None):
     # train_inputs += torch.distributions.Normal(0, 0.1).sample(train_inputs.shape).to(train_inputs)
     # train_targets += torch.distributions.Normal(0, 0.1).sample(train_targets.shape).to(train_targets)
 
-    # train_inputs_mean = torch.mean(train_inputs, dim=0)
-    # train_targets_mean = torch.mean(train_targets, dim=0)
-
-    # train_inputs_std = torch.std(train_inputs, dim=0)
-    # train_targets_std = torch.std(train_targets, dim=0)
-
-    # train_inputs = (train_inputs - train_inputs_mean) / train_inputs_std
-    # test_inputs = (test_inputs - train_inputs_mean) / train_inputs_std
-
-    # train_targets = (train_targets - train_targets_mean) / train_targets_std
-    # test_targets = (test_targets - train_targets_mean) / train_targets_std
-
     train_loader = BatchedInMemoryDatabase(train_inputs, train_targets, batch_size=batch_size)
     test_loader = BatchedInMemoryDatabase(test_inputs, test_targets, batch_size=batch_size)
 
-    model = MecanumDriveModel(4 + 3, 6, 128, **factory_kwargs); torch.compile(model, options={"triton.cudagraphs" : True})
+    model = drivemodel.MecanumDriveModel(**factory_kwargs); torch.compile(model, options={"triton.cudagraphs" : True})
     optimizer = adabelief_pytorch.AdaBelief(model.parameters(), lr=0.01, eps=torch.finfo(dtype).eps, weight_decay=0.001)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.2, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.05, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
 
     start = time.time_ns()
     for epoch in range(num_epochs):
@@ -195,8 +169,10 @@ def main(device=None, dtype=None):
             print(f"\r\033[KEpoch [{epoch+1}/{num_epochs}], Loss: {loss:.8f}, LR: {', '.join(str(i['lr']) for i in optimizer.param_groups)}")
             start = now
 
+    torch.save(model.state_dict(), 'state_dict.pt')
+    # torch.save((inputs_mean, inputs_std, targets_mean, targets_std), 'scale_factors.pt')
     print_model_weights(model)
 
 if __name__=="__main__":
-    torch.set_num_threads(1)
-    main(torch.device("cuda"), torch.float32)
+    torch.set_num_threads(16)
+    main(torch.device("cpu"), torch.float32)
