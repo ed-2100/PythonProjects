@@ -1,7 +1,7 @@
 import torch
 
 G = 13.7 # 5.2
-w_free = 435 # 1150
+w_free = 435 / 60 * 2 * torch.pi # 1150
 
 r = 3 * 0.0254 # m
 

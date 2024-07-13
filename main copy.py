@@ -18,31 +18,17 @@ def create_data_tensors(num_samples: int,
                         device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
     position = torch.zeros((num_samples, 3), **factory_kwargs)
-    position[:, 2] = torch.distributions.Uniform(-torch.pi, torch.pi).sample((num_samples,)).to(position)
 
     local_duty = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs)
+    local_duty = local_duty / 3
     wheel_duty = torch.matmul(robotsystem.control_duty_to_motor_duty.to(local_duty), local_duty.unsqueeze(-1)).squeeze(-1)
-    a = torch.max(wheel_duty, dim=-1, keepdim=True).values
-    b = torch.maximum(torch.full_like(a, 1), a)
-    print(b.shape)
-    wheel_duty = wheel_duty / b
-    c = torch.sum(wheel_duty, dim=-1, keepdim=True)
-    d = torch.maximum(torch.full_like(c, 1), c)
-    wheel_duty = wheel_duty / d
-    print(d.shape)
-    wheel_velocity = wheel_duty * 300
+    wheel_velocity = wheel_duty * robotsystem.w_free
     velocity = torch.matmul(robotsystem.wheel_rot_to_local.to(wheel_velocity), wheel_velocity.unsqueeze(-1)).squeeze(-1)
 
     state = torch.cat([position, velocity], dim = -1)
+
     control = torch.distributions.Uniform(-1, 1).sample((num_samples, 3)).to(**factory_kwargs)
-    control = torch.matmul(robotsystem.control_duty_to_motor_duty.to(control), control.unsqueeze(-1)).squeeze(-1)
-    a = torch.max(control, dim=-1, keepdim=True).values
-    b = torch.maximum(torch.full_like(a, 1), a)
-    control = control / b
-    c = torch.sum(control, dim=-1, keepdim=True)
-    d = torch.maximum(torch.full_like(c, 1), c)
-    control = control / d
-    control = torch.matmul(robotsystem.motor_duty_to_control_duty.to(control), control.unsqueeze(-1)).squeeze(-1)
+    control = control / 3
 
     model = robotsystem.MecanumSystemModel(**factory_kwargs)
     model.set_control_duty(control)
@@ -52,9 +38,19 @@ def create_data_tensors(num_samples: int,
                                            torch.tensor((0, drivemodel.delta_t), **factory_kwargs),
                                            method='rk4',
                                            options=dict(step_size=drivemodel.delta_t/10))[-1] - state
+    
+    c = torch.cos(-predicted[..., 2])
+    s = torch.sin(-predicted[..., 2])
+    tmat = torch.empty(predicted.shape[:-1] + (2, 2))
+    tmat[..., 0, 0] = c
+    tmat[..., 0, 1] = -s
+    tmat[..., 1, 0] = s
+    tmat[..., 1, 1] = c
+
+    predicted[..., 3:5] = (tmat @ predicted[..., 3:5].unsqueeze(-1)).squeeze(-1)
     # predicted[0] = ((predicted[2] + torch.pi) % (2 * torch.pi)) - torch.pi
 
-    return (torch.cat([state[:, 2:], control], dim = -1), predicted)
+    return (torch.cat([velocity, control], dim = -1), predicted)
 
 def print_model_weights(model: nn.Module):
     for param_tensor in model.state_dict():

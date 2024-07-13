@@ -9,7 +9,7 @@ class MecanumDriveModel(nn.Module):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super(MecanumDriveModel, self).__init__()
 
-        input_dim = 7
+        input_dim = 6
         output_dim = 6
         hidden_dim = 128
 

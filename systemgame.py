@@ -48,7 +48,7 @@ key_behavior = torch.tensor(((0, -1,  0,  1,  0,  0),
                              (0,  0,  0,  0,  1, -1)), **param2)
 key = torch.full((6,), 0, **param2)
 
-model = robotsystem.MecanumSystemModel(control, **param2)
+model = robotsystem.MecanumSystemModel(**param2)
 
 rect_size = unit * in_to_m * 12
 rect_surface = pygame.Surface(tuple(rect_size.cpu().to(dtype=torch.int).numpy()), pygame.SRCALPHA)

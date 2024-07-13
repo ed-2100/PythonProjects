@@ -5,8 +5,8 @@ model = drivemodel.MecanumDriveModel('cpu', torch.float)
 model.load_state_dict(torch.load('state_dict.pt'))
 
 model.eval()
-inputs_mean, inputs_std, outputs_mean, outputs_std = torch.load('scale_factors.pt')
-print(inputs_mean, inputs_std, outputs_mean, outputs_std, sep='\n')
+# inputs_mean, inputs_std, outputs_mean, outputs_std = torch.load('scale_factors.pt')
+# print(inputs_mean, inputs_std, outputs_mean, outputs_std, sep='\n')
 
 import math
 import pygame
@@ -84,10 +84,28 @@ while running:
     control[:2] = torch.nan_to_num(control[:2] / torch.sqrt(torch.sum(torch.square(control[:2]))))
     control /= math.sqrt(2) / 2 * 2 + 1
 
-    inputs = torch.cat((state[2:], control))
+    c = torch.cos(-state[2])
+    s = torch.sin(-state[2])
+    tmat = torch.tensor(((c, -s),
+                         (s, c)))
+    a = state[3:]
+    a[:2] = (tmat @ a[:2].unsqueeze(-1)).squeeze(-1)
+
+    inputs = torch.cat((a, control))
+    
     # inputs = (inputs - inputs_mean) / inputs_std
 
     outputs = model.forward(inputs.unsqueeze(0)).squeeze(0)
+
+    outputs[:2] = (torch.pinverse(tmat) @ outputs[:2].unsqueeze(-1)).squeeze(-1)
+
+    c = torch.cos(state[2] + outputs[2])
+    s = torch.sin(state[2] + outputs[2])
+    tmat = torch.tensor(((c, -s),
+                         (s, c)))
+    
+    outputs[3:5] = (tmat @ outputs[3:5].unsqueeze(-1)).squeeze(-1)
+
     # outputs = (outputs * outputs_std) + outputs_mean
     state += outputs
     # state[:2] += outputs[:2]
