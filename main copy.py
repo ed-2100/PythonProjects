@@ -34,23 +34,12 @@ def create_data_tensors(num_samples: int,
     model.set_control_duty(control)
 
     predicted = torchdiffeq.odeint_adjoint(model,
-                                           state,
+                                           torch.empty_like(state).copy_(state),
                                            torch.tensor((0, drivemodel.delta_t), **factory_kwargs),
                                            method='rk4',
                                            options=dict(step_size=drivemodel.delta_t/10))[-1] - state
     
-    c = torch.cos(-predicted[..., 2])
-    s = torch.sin(-predicted[..., 2])
-    tmat = torch.empty(predicted.shape[:-1] + (2, 2))
-    tmat[..., 0, 0] = c
-    tmat[..., 0, 1] = -s
-    tmat[..., 1, 0] = s
-    tmat[..., 1, 1] = c
-
-    predicted[..., 3:5] = (tmat @ predicted[..., 3:5].unsqueeze(-1)).squeeze(-1)
-    # predicted[0] = ((predicted[2] + torch.pi) % (2 * torch.pi)) - torch.pi
-
-    return (torch.cat([velocity, control], dim = -1), predicted)
+    return (torch.cat([state[..., 3:], control], dim = -1), predicted)
 
 def print_model_weights(model: nn.Module):
     for param_tensor in model.state_dict():
@@ -120,21 +109,21 @@ class BatchedInMemoryDatabase:
 
 def main(device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
-    num_epochs = 5000
+    num_epochs = 50000
     num_test = 1000
-    num_train = 40000
-    batch_size = 40000 # 128
+    num_train = 20000
+    batch_size = 20000 # 128
 
     inputs, targets = create_data_tensors(num_train + num_test, **factory_kwargs)
 
-    # inputs_mean = torch.mean(inputs, dim=0)
-    # targets_mean = torch.mean(targets, dim=0)
+    inputs_mean = torch.mean(inputs, dim=0)
+    targets_mean = torch.mean(targets, dim=0)
     
-    # inputs_std = torch.std(inputs, dim=0)
-    # targets_std = torch.std(targets, dim=0)
+    inputs_std = torch.std(inputs, dim=0)
+    targets_std = torch.std(targets, dim=0)
 
-    # inputs = (inputs - inputs_mean) / inputs_std
-    # targets = (targets - targets_mean) / targets_std
+    inputs = (inputs - inputs_mean) / inputs_std
+    targets = (targets - targets_mean) / targets_std
 
     randind = torch.randperm(inputs.shape[0])
     randomized_inputs = inputs[randind]
@@ -152,8 +141,8 @@ def main(device=None, dtype=None):
     test_loader = BatchedInMemoryDatabase(test_inputs, test_targets, batch_size=batch_size)
 
     model = drivemodel.MecanumDriveModel(**factory_kwargs); torch.compile(model, options={"triton.cudagraphs" : True})
-    optimizer = adabelief_pytorch.AdaBelief(model.parameters(), lr=0.01, eps=torch.finfo(dtype).eps, weight_decay=0.001)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.05, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
+    optimizer = adabelief_pytorch.AdaBelief(model.parameters(), lr=0.01, eps=1e-5, weight_decay=0.001)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, 0.1, pct_start=0.3, steps_per_epoch=len(train_loader), epochs=num_epochs)
 
     start = time.time_ns()
     for epoch in range(num_epochs):
@@ -165,10 +154,10 @@ def main(device=None, dtype=None):
             print(f"\r\033[KEpoch [{epoch+1}/{num_epochs}], Loss: {loss:.8f}, LR: {', '.join(str(i['lr']) for i in optimizer.param_groups)}")
             start = now
 
-    torch.save(model.state_dict(), 'state_dict.pt')
-    # torch.save((inputs_mean, inputs_std, targets_mean, targets_std), 'scale_factors.pt')
+    torch.save(model.cpu().state_dict(), 'state_dict.pt')
+    torch.save((inputs_mean.cpu(), inputs_std.cpu(), targets_mean.cpu(), targets_std.cpu()), 'scale_factors.pt')
     print_model_weights(model)
 
 if __name__=="__main__":
-    torch.set_num_threads(16)
-    main(torch.device("cpu"), torch.float32)
+    torch.set_num_threads(1)
+    main(torch.device("cuda"), torch.float32)

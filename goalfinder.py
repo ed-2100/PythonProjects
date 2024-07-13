@@ -1,17 +1,8 @@
 import torch
 import drivemodel
-
-model = drivemodel.MecanumDriveModel('cpu', torch.float)
-model.load_state_dict(torch.load('state_dict.pt'))
-
-model.eval()
-# inputs_mean, inputs_std, outputs_mean, outputs_std = torch.load('scale_factors.pt')
-# print(inputs_mean, inputs_std, outputs_mean, outputs_std, sep='\n')
-
 import math
 import pygame
 import time
-import torchdiffeq
 
 torch.set_num_threads(1)
 
@@ -20,6 +11,13 @@ dtype = torch.float32
 
 param1 = {'device': device}
 param2 = {'device': device, 'dtype': dtype}
+
+model = drivemodel.MecanumDriveModel(**param2)
+model.load_state_dict(torch.load('state_dict.pt'))
+
+model.eval()
+inputs_mean, inputs_std, outputs_mean, outputs_std = (i.to(**param2) for i in torch.load('scale_factors.pt'))
+print(inputs_mean, inputs_std, outputs_mean, outputs_std, sep='\n')
 
 in_to_m = 0.0254
 
@@ -84,32 +82,24 @@ while running:
     control[:2] = torch.nan_to_num(control[:2] / torch.sqrt(torch.sum(torch.square(control[:2]))))
     control /= math.sqrt(2) / 2 * 2 + 1
 
+    inputs = torch.cat((state[3:], control))
+
     c = torch.cos(-state[2])
     s = torch.sin(-state[2])
     tmat = torch.tensor(((c, -s),
-                         (s, c)))
-    a = state[3:]
-    a[:2] = (tmat @ a[:2].unsqueeze(-1)).squeeze(-1)
-
-    inputs = torch.cat((a, control))
+                         (s,  c)))
+    inputs[:2] = (tmat @ inputs[:2].unsqueeze(-1)).squeeze(-1)
     
-    # inputs = (inputs - inputs_mean) / inputs_std
+    now = time.time()
+    with torch.no_grad():
+        outputs = (model.forward(((inputs - inputs_mean) / inputs_std).unsqueeze(0)).squeeze(0) * outputs_std) + outputs_mean
+    print(time.time() - now)
 
-    outputs = model.forward(inputs.unsqueeze(0)).squeeze(0)
-
-    outputs[:2] = (torch.pinverse(tmat) @ outputs[:2].unsqueeze(-1)).squeeze(-1)
-
-    c = torch.cos(state[2] + outputs[2])
-    s = torch.sin(state[2] + outputs[2])
-    tmat = torch.tensor(((c, -s),
-                         (s, c)))
-    
+    tmat = torch.pinverse(tmat)
+    outputs[:2] = (tmat @ outputs[:2].unsqueeze(-1)).squeeze(-1)
     outputs[3:5] = (tmat @ outputs[3:5].unsqueeze(-1)).squeeze(-1)
 
-    # outputs = (outputs * outputs_std) + outputs_mean
     state += outputs
-    # state[:2] += outputs[:2]
-    # state[2:] = outputs[2:]
     state[2] = ((state[2] + torch.pi) % (2 * torch.pi)) - torch.pi
     
     rotated_surface = pygame.transform.rotate(rect_surface, state[2] / torch.pi * 180)
