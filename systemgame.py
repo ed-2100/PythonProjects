@@ -5,13 +5,13 @@ import torch
 import time
 import torchdiffeq
 
-torch.set_num_threads(1)
-
 device = 'cpu'
 dtype = torch.float32
 
 param1 = {'device': device}
 param2 = {'device': device, 'dtype': dtype}
+
+torch.set_num_threads(1)
 
 in_to_m = 0.0254
 
@@ -28,8 +28,8 @@ center = res / 2
 def game_to_screen(coords, device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
     to_screen = torch.tensor(((1,  0),
-                              (0, -1)), **factory_kwargs)
-    return center + center * (to_screen @ coords.unsqueeze(-1)).squeeze(-1)
+                              (0, -1)), **factory_kwargs) * unit
+    return center + (to_screen @ coords.unsqueeze(-1)).squeeze(-1)
 
 framerate = 30
 delta_t = 1 / framerate # initial
@@ -39,7 +39,7 @@ pygame.init()
 screen_surface = pygame.display.set_mode(tuple(res.cpu().numpy()))
 pygame.display.set_caption('Mecanum Simulator')
 
-state = torch.tensor((0, 0, 0, 0, 0, 0), **param2) #initial
+state = torch.tensor((0, 0, torch.pi / 2, 0, 0, 0), **param2) #initial
 control = torch.tensor((0, 0, 0), **param2) # initial
 
 keys = (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d, pygame.K_LEFT, pygame.K_RIGHT)
@@ -53,7 +53,7 @@ model = robotsystem.MecanumSystemModel(**param2)
 rect_size = unit * in_to_m * 12
 rect_surface = pygame.Surface(tuple(rect_size.cpu().to(dtype=torch.int).numpy()), pygame.SRCALPHA)
 rect_surface.fill((255, 0, 0))
-pygame.draw.circle(rect_surface, (0, 255, 0), (rect_size[0].item() / 2, 0), rect_size[0].item() / 4)
+pygame.draw.circle(rect_surface, (0, 255, 0), (rect_size[0].item(), rect_size[1].item() / 2), rect_size[0].item() / 4)
 
 frametime = delta_t
 running = True

@@ -56,8 +56,8 @@ class MecanumSystemModel(torch.nn.Module):
     def forward(self, t: torch.Tensor, state: torch.Tensor):
         absolute_vel = state[..., 3:]
         theta = state[..., 2]
-
-        c, s = torch.cos(-theta), torch.sin(-theta)
+    
+        c, s = torch.cos(-theta + torch.pi / 2), torch.sin(-theta + torch.pi / 2)
         absolute_to_local = torch.zeros(state.shape[:-1] + (3, 3), **self.factory_kwargs)
         absolute_to_local[..., 0, 0] = c
         absolute_to_local[..., 0, 1] = -s
