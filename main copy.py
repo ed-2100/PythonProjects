@@ -6,11 +6,6 @@ import torch.nn.functional as F
 import torchdiffeq
 import time
 import adabelief_pytorch
-
-# global_seed = 123456789
-
-# torch.manual_seed(global_seed)
-
 import drivemodel
 import robotsystem
 
@@ -133,9 +128,6 @@ def main(device=None, dtype=None):
     train_targets = randomized_targets[:num_train]
     test_inputs = randomized_inputs[num_train:]
     test_targets = randomized_targets[num_train:]
-
-    # train_inputs += torch.distributions.Normal(0, 0.1).sample(train_inputs.shape).to(train_inputs)
-    # train_targets += torch.distributions.Normal(0, 0.1).sample(train_targets.shape).to(train_targets)
 
     train_loader = BatchedInMemoryDatabase(train_inputs, train_targets, batch_size=batch_size)
     test_loader = BatchedInMemoryDatabase(test_inputs, test_targets, batch_size=batch_size)
